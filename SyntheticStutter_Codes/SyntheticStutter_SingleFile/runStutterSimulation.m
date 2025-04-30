@@ -1,144 +1,112 @@
 function [xHist, U_hist, sigmaA_hist, stutteredAudio, tspan, FE_hist, freezeMask] = runStutterSimulation(audData, Fs, params, P)
-%RUNSTUTTERSIMULATION  Two‐state predictive‐processing stutter sim (no x2 noise).
+%RUNSTUTTERSIMULATION  Two‐state predictive‐processing stutter sim with
+%                     organic freezes that only trigger on the largest F‐peaks.
+%
 %   [xHist,U_hist,sigmaA_hist,stutteredAudio,tspan,FE_hist,freezeMask] =
 %       runStutterSimulation(audData, Fs, params, P)
-%
-%   Inputs:
-%     audData        – vector of audio samples
-%     Fs             – sampling rate
-%     params         – struct with fields .constants, .config, .modelParams
-%     P              – vector of word‐predictability annotations
-%
-%   Outputs:
-%     xHist          – [nSteps×2] state history (x1,x2)
-%     U_hist         – [nSteps×1] word‐level uncertainty
-%     sigmaA_hist    – [nSteps×1] precision (=1/uncertainty)
-%     stutteredAudio – audio after applying freezes
-%     tspan          – [1×nSteps] time vector
-%     FE_hist        – [nSteps×1] free energy time course
-%     freezeMask     – [nSteps×1] logical mask of freeze‐moments
 
-    %% —— DEBUG DUMP —— 
-    fprintf('>>> runStutterSimulation parameters:\n');
-    fprintf('    noise.amp        = %.3g\n', params.constants.noise.amp);
-    fprintf('    freezeThreshold  = %.3g\n\n', params.modelParams.freezeThreshold);
+%% 1) Unpack constants, config, modelParams
+C   = params.constants;
+cfg = params.config;
+mp  = params.modelParams;
 
-    %% Unpack
-    C   = params.constants;    % dtBase, smoothingWindow, eps, noiseAmplitude, etc.
-    cfg = params.config;       % dtBase, smoothingWindow, defaultFreezeThreshold, etc.
-    mp  = params.modelParams;  % xp1, k, sigma1, sigma2, freezeThreshold, surprisalImpact
+%% 2) Set defaults
+if ~isfield(mp,'k'),          mp.k          = 1.0;       end
+if ~isfield(mp,'sigma1'),     mp.sigma1     = 1.0;       end
+if ~isfield(mp,'sigma2'),     mp.sigma2     = 1.0;       end
+if ~isfield(mp,'sigmaA'),     mp.sigmaA     = 1.0;       end
+if ~isfield(mp,'sigmaS'),     mp.sigmaS     = 1.0;       end
+if ~isfield(mp,'xp1'),        mp.xp1        = 0.0;       end
+if ~isfield(mp,'xp2'),        mp.xp2        = 0.0;       end
+if ~isfield(mp,'alpha'),      mp.alpha      = 1.0;       end  % U→Π gain
+if ~isfield(mp,'beta'),       mp.beta       = 1.0;       end  % Π→inhibition gain
+if ~isfield(mp,'attention'),  mp.attention = cfg.defaultAttentionLevel; end
 
-    %% Time step & learning rate
-    dt = cfg.dtBase;
-    if isfield(cfg,'learningRate')
-        lr = cfg.learningRate;
+% gamma now acts as a free‐energy threshold: only peaks > gamma trigger freezes
+if ~isfield(mp,'gamma'),      mp.gamma      = 50.0;      end  
+
+if ~isfield(C,'freezeHoldDuration'), C.freezeHoldDuration = 0.150; end  % seconds
+if ~isfield(C,'eps'),         C.eps         = 1e-3;     end
+if ~isfield(C,'noise')||~isfield(C.noise,'amp'), C.noise.amp=0.10; end
+if ~isfield(C,'dtBase'),      C.dtBase      = 0.001;    end
+
+%% 3) Time vector & preallocate
+dt      = C.dtBase;
+tspan   = 0:dt:(numel(audData)-1)/Fs;
+nSteps  = numel(tspan);
+
+xHist          = zeros(nSteps,2);
+U_hist         = zeros(nSteps,1);
+sigmaA_hist    = zeros(nSteps,1);
+FE_hist        = zeros(nSteps,1);
+freezeMask     = false(nSteps,1);
+stutteredAudio = audData;
+
+%% 4) Initial states & freeze timer
+xHist(1,:)   = [mp.xp1, mp.xp2];
+freezeTimer  = 0;
+
+%% 5) Main loop
+for i = 2:nSteps
+    % 5.1) Uncertainty from annotations P
+    if numel(P)==nSteps
+        U = P(i);
     else
-        lr = 0.01;
+        idx = min(numel(P), ceil(i/nSteps * numel(P)));
+        U = P(idx);
+    end
+    U_hist(i) = U;
+
+    % 5.2) Baseline precision modulated by attention
+    Pi0 = mp.attention / max(mp.sigmaA, C.eps);
+    Pi_t = Pi0 * (1 + mp.alpha * U);
+    sigmaA_hist(i) = Pi_t;
+
+    % 5.3) Compute free energy & gradient
+    mp_dyn         = mp;
+    mp_dyn.sigmaA  = 1 / Pi_t;
+    sa = audData(i);
+    ss = 0;
+    [F, dFdx] = fe_full(xHist(i-1,:)', mp_dyn, sa, ss, C, []);
+    FE_hist(i) = F;
+
+    % 5.4) Inhibition grows with precision
+    inhibition = 1 + mp.beta * Pi_t;
+
+    % 5.5) Detect large F‐peak
+    isNewPeak = i>2 && ...
+                FE_hist(i-1)>FE_hist(i-2) && ...
+                FE_hist(i-1)>FE_hist(i) && ...
+                FE_hist(i-1) > mp.gamma;
+
+    if freezeTimer==0 && isNewPeak
+        freezeTimer = round(C.freezeHoldDuration / dt);
     end
 
-    %% Noise amplitudes
-    %cogNoise   = C.eps;              % small noise for x1
-    cogNoise = C.epsilonConst;  % small noise for x1
-    % motorNoise = C.noiseAmplitude; % removed: no noise on x2
+    % 5.6) State updates & holding logic
+    dx1 = - mp.k * dFdx(1);
+    x1n = xHist(i-1,1) + dx1 * dt;
 
-    %% Time vector
-    Nsamples = numel(audData);
-    T_end    = (Nsamples-1)/Fs;
-    tspan    = 0:dt:T_end;
-    nSteps   = numel(tspan);
-
-    %% Word‐level annotations
-    P      = P(:);
-    Nw     = numel(P);
-    segDur = T_end / max(Nw,1);
-
-    %% Preallocate & seed x1
-    xHist        = zeros(nSteps,2);
-    if isfield(mp,'xp1')
-        xHist(1,1) = mp.xp1;
-    end
-    U_hist        = nan(nSteps,1);
-    sigmaA_hist   = nan(nSteps,1);
-    FE_hist       = nan(nSteps,1);
-
-    %% Main simulation loop
-    for k = 1:(nSteps-1)
-        curr_x = xHist(k,:).';   % [x1; x2]
-        t      = tspan(k);
-
-        % — Word‐level uncertainty & surprisal —
-        if Nw>0
-            wi     = min(Nw, floor(t/segDur)+1);
-            U_word = P(wi);
-            S_word = -log(U_word + C.epsilonConst);
-        else
-            U_word = 1;
-            S_word = 0;
-        end
-        U_hist(k)      = U_word;
-        sigmaA_hist(k) = 1./(U_word + C.epsilonConst);
-
-        % — Sensory sample —
-        idxA = min(round(t*Fs)+1, Nsamples);
-        sa   = audData(idxA);
-        ss   = 0;
-
-        % — Surprisal impact on x1 —
-        if isfield(mp,'surprisalImpact')
-            curr_x(1) = curr_x(1) + mp.surprisalImpact * S_word;
-        end
-
-        % — Compute free energy & gradient —
-        FE_hist(k) = computeFreeEnergy(curr_x, mp, sa, ss, U_word, S_word, C);
-        gradF = numericGradient( ...
-            @(xx) computeFreeEnergy(xx, mp, sa, ss, U_word, S_word, C), ...
-            curr_x, C.epsilonConst );
-
-
-        % — State update with noise only on x1 —
-        noise        = [cogNoise*randn; 0];   % zero motor noise on x2
-        dx           = -lr*gradF + noise;
-        xHist(k+1,:) = (curr_x + dx).';
+    if freezeTimer > 0
+        % hold (stall) x2 for the duration
+        x2n = xHist(i-1,2);
+        freezeTimer = freezeTimer - 1;
+        freezeMask(i) = true;
+    else
+        % normal damped gradient‐descent + noise
+        dx2 = - mp.k * dFdx(2) / inhibition;
+        x2n = xHist(i-1,2) + dx2 * dt + sqrt(dt)*C.noise.amp*randn;
     end
 
-    %% Detect freezes by smoothed x2‐velocity threshold
-    vel2    = [0; abs(diff(xHist(:,2)))]/dt;      % instantaneous x2‐speed
-    W       = cfg.smoothingWindow;               
-    vel_sm  = movmean(vel2, W);                  
-    freezeMask = vel_sm < mp.freezeThreshold;     % freeze when slow
-
-    %% Apply freezes to audio
-    stutteredAudio = applyFreezeBlock(audData, freezeMask, Fs, C);
+    xHist(i,:) = [x1n, x2n];
 end
 
-%% ─── computeFreeEnergy ─────────────────────────────────────────────────
-function fe = computeFreeEnergy(x, mp, sa, ss, U_word, S_word, C)
-    x1 = x(1); x2 = x(2);
-
-    % — Prior term —
-    if isfield(mp,'xp1'), pv = mp.xp1; else pv = 0; end
-    if isfield(mp,'sigma1'), s1 = mp.sigma1; else s1 = 1; end
-    priorErr = (x1 - pv)^2 / (2 * s1);
-
-    % — Motor‐prediction term —
-    if isfield(mp,'k'), kVal = mp.k; else kVal = 1; end
-    if isfield(mp,'sigma2'), s2 = mp.sigma2; else s2 = 1; end
-    predErr  = C.attenuationOffset * (x2 - kVal*x1)^2 / max(s2,1e-3);
-
-    % — Uncertainty penalty —
-    uncErr   = U_word * log(1 + S_word);
-
-    fe = priorErr + predErr + uncErr;
+%% 6) Build stuttered audio by holding samples during freezes
+for idx = find(freezeMask)'
+    samp = round((idx-1)*dt*Fs) + 1;
+    if samp>1 && samp<=numel(stutteredAudio)
+        stutteredAudio(samp) = stutteredAudio(samp-1);
+    end
 end
 
-%% ─── numericGradient ───────────────────────────────────────────────────
-function g = numericGradient(fun, x0, epsStep)
-    n = numel(x0);
-    g = zeros(size(x0));
-    for j = 1:n
-        dp      = zeros(size(x0)); dp(j) = epsStep;
-        f_plus  = fun(x0 + dp);
-        f_minus = fun(x0 - dp);
-        g(j)    = (f_plus - f_minus) / (2 * epsStep);
-    end
 end
